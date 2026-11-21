@@ -14,6 +14,8 @@ RUN adduser -D -u 1001 telecodex \
   && mkdir -p /workspace /home/telecodex/.codex \
   && chown -R telecodex:telecodex /workspace /home/telecodex
 
+ENV PATH="/app/node_modules/.bin:${PATH}"
+
 USER telecodex
 
 CMD ["node", "dist/index.js"]
