@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
+import { sequentialize } from "@grammyjs/runner";
 import type { ModelReasoningEffort } from "@openai/codex-sdk";
 import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 
@@ -269,6 +270,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
+  const pendingApprovals = new Map<string, {
+    contextKey: TelegramContextKey;
+    userId: number | undefined;
+    resolve: (accepted: boolean) => void;
+  }>();
+
   const handleUserPrompt = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -521,6 +528,41 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const callbacks: CodexSessionCallbacks = {
+      onApproval: async (details, signal) => {
+        if (signal.aborted) return false;
+        const id = randomUUID();
+        const keyboard = new InlineKeyboard()
+          .text("Approve once", `approve:yes:${id}`)
+          .text("Decline", `approve:no:${id}`);
+        let clear = () => {};
+        const decision = new Promise<boolean>((resolve) => {
+          pendingApprovals.set(id, { contextKey, userId: ctx.from?.id, resolve });
+          const cancel = () => resolve(false);
+          const timeout = setTimeout(cancel, 5 * 60_000);
+          signal.addEventListener("abort", cancel, { once: true });
+          clear = () => {
+            clearTimeout(timeout);
+            signal.removeEventListener("abort", cancel);
+            pendingApprovals.delete(id);
+          };
+        });
+        let messageId: number | undefined;
+        try {
+          const message = await bot.api.sendMessage(chatId, `Codex approval requested
+
+${details.slice(0, 3800)}`, {
+            reply_markup: keyboard,
+            message_thread_id: messageThreadId,
+          });
+          messageId = message.message_id;
+          return await decision;
+        } finally {
+          clear();
+          if (messageId !== undefined) {
+            void bot.api.editMessageReplyMarkup(chatId, messageId).catch(() => {});
+          }
+        }
+      },
       onTextDelta: (delta: string) => {
         accumulatedText += delta;
         if (!responseMessageId) {
@@ -775,6 +817,25 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await next();
+  });
+
+  // Approval and abort callbacks must run while a prompt owns its conversation's queue.
+  bot.use(sequentialize((ctx) => {
+    const data = ctx.callbackQuery?.data;
+    if (data?.startsWith("approve:") || data?.startsWith("codex_abort:")) return [];
+    return contextKeyFromCtx(ctx) ?? [];
+  }));
+
+  bot.callbackQuery(/^approve:(yes|no):([a-f0-9-]+)$/, async (ctx) => {
+    const pending = pendingApprovals.get(ctx.match[2]);
+    if (!pending || pending.contextKey !== contextKeyFromCtx(ctx) || pending.userId !== ctx.from.id) {
+      await ctx.answerCallbackQuery({ text: "Approval expired or belongs to another user" });
+      return;
+    }
+    pendingApprovals.delete(ctx.match[2]);
+    const accepted = ctx.match[1] === "yes";
+    pending.resolve(accepted);
+    await ctx.answerCallbackQuery({ text: accepted ? "Approved once" : "Declined" });
   });
 
   bot.command("start", async (ctx) => {

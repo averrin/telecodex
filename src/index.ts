@@ -1,3 +1,4 @@
+import { run, type RunnerHandle } from "@grammyjs/runner";
 import { createBot, registerCommands } from "./bot.js";
 import { checkAuthStatus } from "./codex-auth.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
@@ -41,6 +42,7 @@ try {
 }
 
 let shuttingDown = false;
+let polling: RunnerHandle | undefined;
 const shutdown = (signal: NodeJS.Signals) => {
   if (shuttingDown) {
     return;
@@ -48,7 +50,7 @@ const shutdown = (signal: NodeJS.Signals) => {
   shuttingDown = true;
 
   console.log(`Received ${signal}, shutting down TeleCodex...`);
-  if (bot) bot.stop();
+  void polling?.stop().catch(() => {});
 
   setTimeout(() => {
     registry?.disposeAll();
@@ -66,12 +68,10 @@ let restartAttempts = 0;
 
 async function startPolling(): Promise<void> {
   try {
-    await bot!.start({
-      drop_pending_updates: true,
-      onStart: () => {
-        restartAttempts = 0;
-      },
-    });
+    await bot!.init();
+    await bot!.api.deleteWebhook({ drop_pending_updates: true });
+    polling = run(bot!, { runner: { maxRetryTime: 0 } });
+    await polling.task();
   } catch (error) {
     if (shuttingDown) {
       return;

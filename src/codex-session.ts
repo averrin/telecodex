@@ -9,6 +9,7 @@ import {
   type UserInput,
 } from "@openai/codex-sdk";
 
+import { AppServerThread, type RequestApproval } from "./codex-appserver.js";
 import type { TeleCodexConfig } from "./config.js";
 import {
   getThread,
@@ -25,6 +26,7 @@ import {
 } from "./codex-launch.js";
 
 export interface CodexSessionCallbacks {
+  onApproval?: RequestApproval;
   onTextDelta: (delta: string) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
   onToolUpdate: (toolCallId: string, partialResult: string) => void;
@@ -73,7 +75,7 @@ export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; 
 
 export class CodexSessionService {
   private codex: Codex | null = null;
-  private thread: Thread | null = null;
+  private thread: Thread | AppServerThread | null = null;
   private currentWorkspace: string;
   private abortController: AbortController | null = null;
   private currentThreadId: string | null = null;
@@ -176,7 +178,10 @@ export class CodexSessionService {
     const lastCommandOutput = new Map<string, string>();
 
     try {
-      const { events } = await this.thread.runStreamed(this.buildSdkInput(input), { signal: controller.signal });
+      const sdkInput = this.buildSdkInput(input);
+      const events = this.thread instanceof AppServerThread
+        ? this.thread.events(sdkInput, controller.signal, callbacks.onApproval)
+        : (await this.thread.runStreamed(sdkInput, { signal: controller.signal })).events;
 
       for await (const event of events) {
         this.handleThreadEvent(event);
@@ -298,7 +303,7 @@ export class CodexSessionService {
 
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
-    this.thread = this.getCodex().startThread(this.buildThreadOptions(effectiveWorkspace, effectiveModel));
+    this.thread = this.makeThread(null, effectiveWorkspace, effectiveModel);
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
@@ -311,10 +316,7 @@ export class CodexSessionService {
   async resumeThread(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("resume a thread");
 
-    this.thread = this.getCodex().resumeThread(
-      threadId,
-      this.buildThreadOptions(this.currentWorkspace, this.currentModel),
-    );
+    this.thread = this.makeThread(threadId, this.currentWorkspace, this.currentModel);
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentThreadId = threadId;
     return this.getInfo();
@@ -327,7 +329,7 @@ export class CodexSessionService {
     const workspace = record?.cwd ?? this.currentWorkspace;
     const model = record?.model || undefined;
 
-    this.thread = this.getCodex().resumeThread(threadId, this.buildThreadOptions(workspace, model));
+    this.thread = this.makeThread(threadId, workspace, model);
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = workspace;
     this.currentThreadId = threadId;
@@ -415,6 +417,14 @@ export class CodexSessionService {
       return parts[0].text;
     }
     return parts;
+  }
+
+  private makeThread(threadId: string | null, workspace: string, model?: string): Thread | AppServerThread {
+    const options = this.buildThreadOptions(workspace, model);
+    if (options.approvalPolicy === "on-request" || options.approvalPolicy === "untrusted") {
+      return new AppServerThread(threadId, options, buildCodexEnv(this.config.codexApiKey));
+    }
+    return threadId ? this.getCodex().resumeThread(threadId, options) : this.getCodex().startThread(options);
   }
 
   private buildThreadOptions(workspace: string, model?: string): {
